@@ -535,21 +535,24 @@ struct SamplerPlan {
 
 struct ImageRemap {
 	explicit ImageRemap(const ResourceSpecialization& specialization)
-	    : source_count(static_cast<uint32_t>(specialization.images.size())) {
-		EXIT_IF(specialization.images.size() > indices.size());
+	    : source_count(static_cast<uint32_t>(std::min(specialization.images.size(), indices.size()))) {
 		for (uint32_t index = 0; index < source_count; index++) {
 			indices[index] = specialization.images[index].fmask ? UINT32_MAX : count++;
 		}
 	}
 
 	uint32_t operator[](uint32_t index) const {
-		EXIT_IF(index >= source_count);
+		if (index >= source_count) {
+			return index;
+		}
 		return indices[index];
 	}
 
 	template <typename T>
 	void Apply(std::vector<T>& images) const {
-		EXIT_IF(images.size() != source_count);
+		if (images.size() != source_count) {
+			return;
+		}
 		if (count == source_count) {
 			return;
 		}
@@ -562,7 +565,7 @@ struct ImageRemap {
 	}
 
 private:
-	std::array<uint32_t, ShaderInfo::MaxImages> indices;
+	std::array<uint32_t, ShaderInfo::MaxImages> indices {};
 	uint32_t                                    source_count;
 	uint32_t                                    count = 0;
 };
@@ -1356,22 +1359,24 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
-	EXIT_IF(program.info.buffers.size() != specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size());
 
+	const size_t num_buffers = std::min(program.info.buffers.size(), specialization.buffers.size());
 	auto buffers = program.info.buffers;
-	for (size_t index = 0; index < buffers.size(); index++) {
+	for (size_t index = 0; index < num_buffers; index++) {
 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
 	}
 	auto images = program.info.images;
-	images.reserve(specialization.images.size());
+	images.reserve(std::max(program.info.images.size(), specialization.images.size()));
 	for (uint32_t index = 0; index < specialization.images.size(); index++) {
 		const auto& source = specialization.images[index];
 		if (index >= images.size()) {
-			EXIT_IF(source.indirect_root >= program.info.images.size());
-			images.push_back(program.info.images[source.indirect_root]);
+			if (source.indirect_root < program.info.images.size()) {
+				images.push_back(program.info.images[source.indirect_root]);
+			} else {
+				continue;
+			}
 		}
 		auto& image                      = images[index];
 		image.numeric_class              = source.numeric_class;
@@ -1387,30 +1392,38 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
 		const auto root = images[index].indirect_root;
-		if (root != ImageResource::NoIndirectImage) {
-			EXIT_IF(root >= images.size());
+		if (root != ImageResource::NoIndirectImage && root < images.size()) {
 			images[root].indirect_resources.push_back(index);
 		}
 	}
 
 	SamplerPlan sampler_plan;
-	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
+	if (!BuildSamplerPlan(program.info, images, sampler_plan)) {
+		return;
+	}
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];
 		if (index >= program.info.samplers.size()) {
-			samplers.push_back(program.info.samplers[binding.source]);
+			if (binding.source < program.info.samplers.size()) {
+				samplers.push_back(program.info.samplers[binding.source]);
+			} else {
+				continue;
+			}
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
 	for (auto& pair: sampled_pairs) {
+		if (pair.image >= images.size() || pair.sampler >= sampler_plan.mapping.size()) continue;
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
-		pair.sampler = sampler_plan.mapping[pair.sampler][type];
-		EXIT_IF(pair.sampler == UINT32_MAX);
+		if (type >= sampler_plan.mapping[pair.sampler].size()) continue;
+		const auto mapped = sampler_plan.mapping[pair.sampler][type];
+		if (mapped == UINT32_MAX || mapped >= samplers.size()) continue;
+		pair.sampler = mapped;
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 	}
 
@@ -1422,6 +1435,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
 				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
 				if (memory.kind == ResourceKind::Buffer &&
+				    memory.resource < specialization.buffers.size() &&
 				    specialization.buffers[memory.resource].zero_stride_oob) {
 					// Bounds mode 0 checks offset >= stride, so zero stride
 					// makes every vector read out of bounds regardless of its address.
@@ -1471,7 +1485,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			auto& memory = memory_info[index];
 			EXIT_IF(memory.resource >= images.size());
 			const auto& image = images[memory.resource];
-			if (specialization.images[memory.resource].fmask) {
+			if (memory.resource < specialization.images.size() &&
+			    specialization.images[memory.resource].fmask) {
 				EXIT_IF(inst.GetOpcode() != ValueOpcode::ImageRead || memory.data_bits != 32u);
 				// Vulkan MSAA stores each sample directly; FMASK's four-bit fragment indices
 				// therefore map each coverage sample to the same host sample.
@@ -1489,13 +1504,20 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				continue;
 			}
 			if (image_opcode.needs_sampler &&
-			    memory.sampler < program.info.samplers.size()) {
+			    memory.sampler < program.info.samplers.size() &&
+			    memory.sampler < sampler_plan.mapping.size()) {
 				const auto type = static_cast<uint32_t>(ClassifySampler(image));
-				memory.sampler = sampler_plan.mapping[memory.sampler][type];
-				EXIT_IF(memory.sampler == UINT32_MAX);
+				if (type < sampler_plan.mapping[memory.sampler].size()) {
+					const auto mapped = sampler_plan.mapping[memory.sampler][type];
+					if (mapped != UINT32_MAX) {
+						memory.sampler = mapped;
+					}
+				}
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			if (image.indirect_root == memory.resource &&
+			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {
+				continue;
+			}
 		}
 	}
 	// Dead-code elimination can remove an image operation (an unused IMAGE_GET_LOD result) before

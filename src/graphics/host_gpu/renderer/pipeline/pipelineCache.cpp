@@ -2715,7 +2715,9 @@ struct PipelineCache::ProgramCache {
 			const bool materialized =
 			    replay || Materialize(*source, runtime, evaluation, scratch, prep, read_attempt);
 			lock.lock();
-			if (!materialized) {
+			if (!materialized ||
+			    (replay && (source->resource_plan.buffers.size() != prep.specialization.buffers.size() ||
+			                source->resource_plan.images.size() > prep.specialization.images.size()))) {
 				FinishInFlight(record);
 				return nullptr;
 			}
@@ -2986,6 +2988,10 @@ struct PipelineCache::ProgramCache {
 		}
 		if (const auto* existing = FindSource(key)) {
 			if (existing->skip_dispatch.load(std::memory_order_relaxed)) return Outcome::Skipped;
+			if (existing->resource_plan.buffers.size() != specialization.buffers.size() ||
+			    existing->resource_plan.images.size() > specialization.images.size()) {
+				return Outcome::Skipped;
+			}
 			if (FindPermutation(*existing, specialization, entry.push_data_cursor)) {
 				return Outcome::Present;
 			}
